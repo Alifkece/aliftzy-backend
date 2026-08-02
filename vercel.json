@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    { "source": "/", "destination": "/api/index" },
+    { "source": "/create-payment", "destination": "/api/create-payment" },
+    { "source": "/webhook", "destination": "/api/webhook" },
+    { "source": "/status", "destination": "/api/status" }
+  ]
+}
