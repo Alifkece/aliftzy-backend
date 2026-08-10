@@ -9,8 +9,13 @@
 //
 // Endpoint tetap di path yang sama (/create-payment) berkat rewrite di
 // vercel.json — tidak berubah.
+//
+// FITUR BARU: nomor WhatsApp buyer sekarang WAJIB (lihat
+// normalizeWhatsapp() di lib/orders.js). Divalidasi setelah cek stok,
+// sebelum Casaku dipanggil — dan ikut disimpan ke order lewat
+// createPendingOrder() supaya tersedia untuk Admin.
 
-import { hasAvailableStock, createPendingOrder } from "../lib/orders.js";
+import { hasAvailableStock, createPendingOrder, normalizeWhatsapp } from "../lib/orders.js";
 import { applyCors, getJsonBody } from "../lib/http.js";
 import { generateQris, qrStringToImageDataUrl } from "../lib/casaku.js";
 
@@ -27,7 +32,7 @@ export default async function handler(req, res) {
 
   try {
     const body = await getJsonBody(req);
-    const { amount, username, productId, packageName } = body;
+    const { amount, username, productId, packageName, whatsapp } = body;
 
     if (!amount || !username) {
       return res.status(400).json({
@@ -53,6 +58,20 @@ export default async function handler(req, res) {
         // sampai buyer lama yang tidak pakai fitur ini ikut terdampak.
         console.error("STOCK CHECK ERROR:", stockErr.message);
       }
+    }
+
+    // ==== FITUR BARU: WHATSAPP WAJIB SEBELUM QR DIBUAT ====
+    // Divalidasi SETELAH cek stok (kalau stok kosong, buyer harus berhenti
+    // di situ, tidak perlu sampai ke validasi WA) tapi SEBELUM Casaku
+    // dipanggil - supaya tidak ada QRIS/order yang dibuat untuk nomor WA
+    // yang tidak valid/kosong.
+    const normalizedWhatsapp = normalizeWhatsapp(whatsapp);
+    if (!normalizedWhatsapp) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Nomor WhatsApp wajib diisi dengan format yang benar (contoh: 08xxxxxxxxxx)."
+      });
     }
 
     let casakuTrx;
@@ -82,7 +101,8 @@ export default async function handler(req, res) {
           packageName,
           username,
           amount: casakuTrx.totalAmount,
-          expiredAt
+          expiredAt,
+          whatsapp: normalizedWhatsapp
         });
       } catch (orderErr) {
         console.error("ORDER CREATE ERROR:", orderErr.message);
