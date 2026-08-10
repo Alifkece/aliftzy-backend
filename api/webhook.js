@@ -1,16 +1,43 @@
 // api/webhook.js
 //
-// Migrasi dari route Express `app.post("/webhook", ...)` di server.js lama
-// ke Vercel Serverless Function. LOGIKA VALIDASI & KLAIM STOK TIDAK DIUBAH
-// SAMA SEKALI — hanya dibungkus ulang jadi handler (req, res) tunggal.
+// MIGRASI: webhook sekarang dikirim oleh Casaku, bukan SiTransfer lagi.
+// WAJIB verifikasi signature (HMAC-SHA256 atas RAW body + header
+// X-Casaku-Signature) SEBELUM memproses apa pun — lihat
+// lib/casaku.js#verifyWebhookSignature. Request dengan signature tidak
+// valid ditolak dengan HTTP 401 dan TIDAK PERNAH menyentuh Firestore.
 //
-// PENTING: webhook ini dipanggil oleh SiTransfer (payment gateway), bukan
-// oleh Frontend Store. Path tetap /webhook (sama persis) berkat rewrite di
-// vercel.json, supaya konfigurasi callback URL di dashboard SiTransfer TIDAK
-// PERLU diubah.
+// bodyParser Vercel DIMATIKAN (lihat `config` di bawah) khusus untuk file
+// ini, supaya kita bisa membaca RAW body mentah — signature Casaku
+// dihitung dari raw body SEBELUM di-parse; hasil JSON.parse ulang tidak
+// dijamin menghasilkan urutan key yang identik dengan body asli, sehingga
+// signature tidak akan pernah cocok kalau kita memakai body yang sudah
+// di-parse ulang.
+//
+// Logika klaim stok (claimStockForOrder) TIDAK DIUBAH selain menambahkan
+// pengaman idempotency di lib/orders.js — lihat catatan di file itu.
+//
+// PENTING: path webhook TETAP /webhook (rewrite di vercel.json tidak
+// diubah) — hanya URL INI yang perlu didaftarkan ulang di dashboard
+// Casaku (bukan URL Frontend Store/Admin yang berubah).
 
 import { claimStockForOrder } from "../lib/orders.js";
-import { applyCors, getJsonBody } from "../lib/http.js";
+import { applyCors } from "../lib/http.js";
+import { verifyWebhookSignature } from "../lib/casaku.js";
+
+export const config = {
+  api: {
+    bodyParser: false
+  }
+};
+
+async function readRawBody(req) {
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
 
 export default async function handler(req, res) {
   applyCors(req, res);
@@ -23,25 +50,40 @@ export default async function handler(req, res) {
     return res.status(404).end();
   }
 
-  const body = await getJsonBody(req);
-
-  console.log("WEBHOOK MASUK:");
-  console.log(body);
-
-  // ==== REVISI STOK QRIS ====
-  // Setelah pembayaran sukses: cek ulang & klaim stok secara atomik supaya
-  // tidak ada 2 buyer yang mendapat stok yang sama (race condition).
-  // Kalau order untuk transaction_id ini tidak ditemukan (mis. dibuat
-  // sebelum revisi ini, atau productId tidak dikirim saat create-payment),
-  // fungsi ini tidak melakukan apa-apa - flow lama (hanya log) tetap berjalan
-  // persis seperti sebelumnya.
+  let rawBody;
   try {
-    const isSuccess =
-      body?.success === true && body?.data?.status === "success";
+    rawBody = await readRawBody(req);
+  } catch (err) {
+    console.error("WEBHOOK: gagal membaca raw body:", err.message);
+    return res.status(400).json({ error: "Gagal membaca body" });
+  }
+
+  const signature = req.headers["x-casaku-signature"];
+  const isValidSignature = verifyWebhookSignature(rawBody, signature);
+
+  if (!isValidSignature) {
+    console.error("WEBHOOK: signature TIDAK VALID — request ditolak.");
+    return res.status(401).json({ error: "Invalid signature" });
+  }
+
+  let body;
+  try {
+    body = JSON.parse(rawBody.toString("utf8") || "{}");
+  } catch {
+    return res.status(400).json({ error: "Body bukan JSON valid" });
+  }
+
+  console.log("WEBHOOK CASAKU MASUK:", body);
+
+  // ==== REVISI STOK QRIS (logic tidak diubah dari sebelumnya, hanya
+  // sumber data status/transactionId yang sekarang mengikuti struktur
+  // payload Casaku: { transactionId, amount, packageName, status, paidAt })
+  try {
+    const isSuccess = String(body?.status || "").toLowerCase() === "paid";
 
     if (isSuccess) {
-      const trx = body?.data?.transaction_id;
-      const paymentType = body?.data?.type || "unknown";
+      const trx = body?.transactionId;
+      const paymentType = "casaku";
 
       if (trx) {
         const result = await claimStockForOrder(trx, paymentType);
@@ -56,8 +98,8 @@ export default async function handler(req, res) {
       }
     }
   } catch (webhookErr) {
-    // Jangan sampai error di logic stok membuat webhook gagal merespons -
-    // gateway pembayaran bisa retry berulang kalau responsnya bukan 200.
+    // Jangan sampai error di logic stok membuat webhook gagal merespons —
+    // Casaku akan retry sampai 3x kalau responsnya bukan 2xx.
     console.error("WEBHOOK STOCK CLAIM ERROR:", webhookErr.message);
   }
 
