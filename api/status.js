@@ -1,30 +1,27 @@
 // api/status.js
 //
-// FILE BARU. Endpoint ini dipanggil oleh Frontend Store (js/app.js ->
-// checkPaymentStatus()) setiap 4 detik selama modal QRIS terbuka, untuk
-// menampilkan status pembayaran secara real-time. Endpoint ini SEBELUMNYA
-// tidak ada di server.js yang diupload, meskipun sudah dipanggil aktif oleh
-// Store dan disebut di README lama.
+// MIGRASI: cek status sekarang ke Casaku (POST /api/generate/check-status),
+// bukan lagi SiTransfer. Dipanggil oleh Frontend Store
+// (js/app.js -> checkPaymentStatus()) setiap 4 detik selama modal QRIS
+// terbuka.
 //
-// Diimplementasikan mengikuti dokumentasi resmi SiTransfer (base URL
-// https://rest.sitranfer.com/payment/api, route POST /status) yang
-// dikonfirmasi oleh pemilik project - BUKAN hasil tebakan.
+// Response ke Frontend Store DIPERTAHANKAN PERSIS SAMA seperti sebelumnya
+// — { data: { status, transaction_id } } — supaya checkPaymentStatus() di
+// js/app.js TIDAK PERLU direvisi.
 //
-// Pola autentikasi & request PERSIS mengikuti /create-payment: otentikasi
-// lewat field `key` di dalam body JSON (SITRANSFER_KEY), tanpa header
-// khusus, ke host yang sama (rest.sitranfer.com/payment/api). Response dari
-// SiTransfer di-passthrough apa adanya ke Frontend Store (sama seperti pola
-// /create-payment yang juga meneruskan `result` SiTransfer tanpa
-// dimodifikasi), supaya format `{ success, data: { transaction_id, status,
-// ... } }` yang sudah dibaca oleh checkPaymentStatus() di Store tetap sama
-// persis.
+// Normalisasi status: Casaku mengirim status resmi "pending" | "paid" |
+// "cancel" | "expired". js/app.js (era SiTransfer) mengenali
+// "success"/"paid"/"completed" sebagai sukses, dan "expired"/"failed"
+// sebagai gagal — "paid" & "expired" Casaku sudah cocok apa adanya, hanya
+// "cancel" yang dipetakan ke "expired" (satu-satunya kosakata gagal yang
+// dikenali frontend) supaya UI tidak macet di status "pending" saat
+// transaksi sebenarnya sudah dibatalkan.
 //
-// TIDAK menyentuh Firestore / logika klaim stok sama sekali - itu murni
-// tanggung jawab /webhook, tidak diduplikasi di sini.
+// TIDAK menyentuh Firestore / logika klaim stok sama sekali — itu murni
+// tanggung jawab /webhook.
 
 import { applyCors, getJsonBody } from "../lib/http.js";
-
-const SITRANSFER_STATUS_URL = "https://rest.sitranfer.com/payment/api/status";
+import { checkStatus } from "../lib/casaku.js";
 
 export default async function handler(req, res) {
   applyCors(req, res);
@@ -47,20 +44,16 @@ export default async function handler(req, res) {
       });
     }
 
-    const response = await fetch(SITRANSFER_STATUS_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        key: process.env.SITRANSFER_KEY,
-        transaction_id: transactionId
-      })
+    const casakuStatus = await checkStatus(transactionId);
+    const normalizedStatus =
+      casakuStatus.status === "cancel" ? "expired" : casakuStatus.status;
+
+    return res.status(200).json({
+      data: {
+        transaction_id: casakuStatus.transactionId,
+        status: normalizedStatus
+      }
     });
-
-    const result = await response.json();
-
-    return res.status(200).json(result);
 
   } catch (err) {
     return res.status(500).json({
