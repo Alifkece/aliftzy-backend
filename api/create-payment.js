@@ -1,15 +1,18 @@
 // api/create-payment.js
 //
-// Migrasi dari route Express `app.post("/create-payment", ...)` di server.js
-// lama ke Vercel Serverless Function. LOGIKA BISNIS TIDAK DIUBAH SAMA SEKALI
-// — hanya dibungkus ulang jadi handler (req, res) tunggal karena Vercel tidak
-// memakai app.listen()/Express router.
+// MIGRASI PAYMENT GATEWAY: SiTransfer -> Casaku (lihat lib/casaku.js).
+// Validasi stok, createPendingOrder, dan urutan logic TIDAK diubah dari
+// versi sebelumnya — hanya pemanggilan payment gateway yang diganti.
+// Format response ke Frontend Store DIPERTAHANKAN PERSIS SAMA
+// ({ success, data: { qris_image, transaction_id, amount, expired_at } })
+// supaya js/app.js (createOrderQris) TIDAK PERLU direvisi sama sekali.
 //
-// Endpoint tetap dapat diakses di path yang SAMA PERSIS (/create-payment)
-// berkat rewrite di vercel.json.
+// Endpoint tetap di path yang sama (/create-payment) berkat rewrite di
+// vercel.json — tidak berubah.
 
 import { hasAvailableStock, createPendingOrder } from "../lib/orders.js";
 import { applyCors, getJsonBody } from "../lib/http.js";
+import { generateQris, qrStringToImageDataUrl } from "../lib/casaku.js";
 
 export default async function handler(req, res) {
   applyCors(req, res);
@@ -32,18 +35,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ==== REVISI STOK QRIS ====
-    // productId bersifat OPSIONAL (field baru, tidak menggantikan field lama)
-    // supaya tetap kompatibel dengan client lama yang belum mengirimnya.
-    // packageName JUGA opsional dengan alasan yang sama (fail-open untuk
-    // client lama), tapi kalau dikirim (client Store yang sudah direvisi
-    // SELALU mengirimnya), stok divalidasi per PAKET - bukan cuma per
-    // productId - supaya paket yang stoknya kosong (mis. "1 Bulan") tidak
-    // dianggap tersedia hanya karena paket lain dari produk yang sama
-    // (mis. "1 Tahun") masih ada stok.
-    // Kalau productId dikirim dan stok (paket ini, atau produk ini kalau
-    // packageName tidak dikirim) sudah pasti habis, JANGAN generate
-    // QRIS / invoice / transaksi sama sekali.
+    // ==== REVISI STOK QRIS (logic tidak diubah dari sebelumnya) ====
     if (productId) {
       try {
         const available = await hasAvailableStock(productId, packageName);
@@ -63,44 +55,50 @@ export default async function handler(req, res) {
       }
     }
 
-    const response = await fetch(
-      "https://rest.sitranfer.com/payment/api/generate",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          key: process.env.SITRANSFER_KEY,
-          channel: "QRIS",
-          amount: Number(amount),
-          player_username: username
-        })
-      }
-    );
+    let casakuTrx;
+    try {
+      casakuTrx = await generateQris(amount);
+    } catch (casakuErr) {
+      console.error("CASAKU GENERATE ERROR:", casakuErr.message, casakuErr.raw || "");
+      return res.status(502).json({
+        success: false,
+        error: "Gagal membuat transaksi QRIS. Coba lagi sebentar lagi."
+      });
+    }
 
-    const result = await response.json();
+    const qrisImageDataUrl = await qrStringToImageDataUrl(casakuTrx.qrString);
+    const expiredAt = new Date(
+      Date.now() + casakuTrx.expiredInMinutes * 60 * 1000
+    ).toISOString();
 
-    // ==== REVISI STOK QRIS ====
-    // Catat order PENDING (hanya jika productId dikirim) supaya /webhook
-    // nanti tahu stok mana yang harus diklaim untuk transaction_id ini.
-    // Ini tidak mengubah response yang dikirim ke frontend sama sekali.
-    if (productId && result && result.success !== false && result?.data?.transaction_id) {
+    // ==== REVISI STOK QRIS (logic tidak diubah dari sebelumnya) ====
+    // Catat order PENDING supaya /webhook nanti tahu stok mana yang harus
+    // diklaim untuk transactionId Casaku ini.
+    if (productId && casakuTrx.transactionId) {
       try {
         await createPendingOrder({
-          transactionId: result.data.transaction_id,
+          transactionId: casakuTrx.transactionId,
           productId,
           packageName,
           username,
-          amount,
-          expiredAt: result.data.expired_at
+          amount: casakuTrx.totalAmount,
+          expiredAt
         });
       } catch (orderErr) {
         console.error("ORDER CREATE ERROR:", orderErr.message);
       }
     }
 
-    return res.status(200).json(result);
+    // Adapter: bentuk response PERSIS SAMA seperti waktu masih SiTransfer.
+    return res.status(200).json({
+      success: true,
+      data: {
+        transaction_id: casakuTrx.transactionId,
+        qris_image: qrisImageDataUrl,
+        amount: casakuTrx.totalAmount,
+        expired_at: expiredAt
+      }
+    });
 
   } catch (err) {
     return res.status(500).json({
