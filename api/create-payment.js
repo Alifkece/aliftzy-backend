@@ -48,9 +48,7 @@ export default async function handler(req, res) {
           return res.status(400).json({
             success: false,
             outOfStock: true,
-            error: packageName
-              ? "Stock paket ini sedang habis."
-              : "Stok produk ini sedang habis. Silakan pilih produk lain atau coba lagi nanti."
+            error: "STOCK SEDANG KOSONG. Hubungi admin untuk melakukan restock."
           });
         }
       } catch (stockErr) {
