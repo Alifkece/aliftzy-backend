@@ -40,21 +40,33 @@ export default async function handler(req, res) {
       });
     }
 
-    // ==== REVISI STOK QRIS (logic tidak diubah dari sebelumnya) ====
+    // ==== REVISI STOK QRIS ====
+    // PERBAIKAN AUDIT: sebelumnya kalau hasAvailableStock() melempar error
+    // (mis. Firestore bermasalah), error itu di-catch lalu DILEWATI diam-diam
+    // dan proses lanjut generate QRIS — artinya kalau pengecekan stok gagal
+    // karena alasan APA PUN, buyer tetap bisa dapat QR walau stok sebenarnya
+    // kosong (fail-open). Ini melanggar aturan wajib "stock habis -> jangan
+    // generate QRIS", jadi sekarang diubah jadi FAIL-CLOSED: kalau
+    // pengecekan stok gagal, STOP dan jangan generate QRIS sama sekali,
+    // bukannya diam-diam melanjutkan.
     if (productId) {
+      let available;
       try {
-        const available = await hasAvailableStock(productId, packageName);
-        if (!available) {
-          return res.status(400).json({
-            success: false,
-            outOfStock: true,
-            error: "STOCK SEDANG KOSONG. Hubungi admin untuk melakukan restock."
-          });
-        }
+        available = await hasAvailableStock(productId, packageName);
       } catch (stockErr) {
-        // Kalau pengecekan stok gagal (mis. Firestore bermasalah), jangan
-        // sampai buyer lama yang tidak pakai fitur ini ikut terdampak.
         console.error("STOCK CHECK ERROR:", stockErr.message);
+        return res.status(503).json({
+          success: false,
+          error: "Gagal memeriksa stok. Coba lagi sebentar lagi."
+        });
+      }
+
+      if (!available) {
+        return res.status(400).json({
+          success: false,
+          outOfStock: true,
+          error: "STOCK SEDANG KOSONG. Hubungi admin untuk melakukan restock."
+        });
       }
     }
 
